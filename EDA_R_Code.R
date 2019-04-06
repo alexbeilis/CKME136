@@ -1,274 +1,8 @@
-#Load necessary packages
-library(dplyr)
-library(lubridate)
-library(tidyr)
-library(ggplot2)
-library(ISOweek)
-library(caret)
-library(randomForest)
-library(MLmetrics)
-library(gridExtra)
-set.seed(1)
-
-#load the daily sales file
-dailySales <- read.csv("C:/Users/Alex/Desktop/Ryerson/2019/CKME136/Data/Rossmann/all/train.csv")
-
-str(dailySales)
-
-#Load the store meta data file.
-storeMeta <- read.csv("C:/Users/Alex/Desktop/Ryerson/2019/CKME136/Data/Rossmann/all/store.csv")
-
-#Add date field to indicate date from which competition existed for a particular store based on
-#provided CompetitionOpenSinceMonth and CompetitionOpenSinceYear fields. Then remove the 2 fields
-# that were used to determine the date.
-storeMeta <- storeMeta %>% mutate(CompetitionSinceDate = 
-                                    as.Date.character(paste(CompetitionOpenSinceYear,
-                                                            CompetitionOpenSinceMonth,
-                                                            "01", sep = "-"))) %>%
-                          select(-c("CompetitionOpenSinceYear","CompetitionOpenSinceMonth"))
-
-
-#Create a seperate table with Promo 2 information.
-promo2Info <- storeMeta %>%
-              separate(PromoInterval,into = c("FirstMonth", "SecondMonth", "ThirdMonth",
-                                              "FourthMonth")) %>%
-              select(Store, Promo2, Promo2SinceWeek, Promo2SinceYear, FirstMonth,
-                     SecondMonth, ThirdMonth, FourthMonth) %>%
-              filter(Promo2 != 0) %>%
-              gather(ApplicableMonth, Month, 5:8 )%>%
-              select(-5)
-
-
-
-#Obtain a list of unique month names from the promo2Info table. This list will be used
-#in the next step to attach calendar month numbers to each row based on month name.
-promo2Months <- unique(promo2Info$Month)
-
-#Add two columns to promo2Info table. The first column will be an actual date of when
-#promo 2 started based on Promo2SinceYear and Promo2SinceWeek. The 2nd column converts
-#the calendar month names to month numbers to indicate the months in which Promo2 is active.
-promo2Info <- promo2Info %>% mutate(Promo2SinceDate = ISOweek2date(
-                            paste(Promo2SinceYear,"-W",
-                              formatC(Promo2SinceWeek, width = 2, flag = "0"),
-                              "-1", sep = "" )),
-                          Promo2MonthNum = match(Month,promo2Months))
-
-
-
-
-#Check the NA values in the storeMeta table.
-lapply(storeMeta, function(x) sum(is.na(x)))
-
-
-#preview the loaded data
-head(dailySales)
-head(storeMeta)
-
-
-#Check the dimensions of the dataset.
-dim(dailySales)
-
-#Check the class format of each column in the table.
-sapply(dailySales, class)
-
-
-
-#Check columns for NAs.
-sapply(dailySales, function(x) sum(is.na(x)))
-
-
-#Convert the Date column from String to an actual date class field.
-dailySales$Date <- ymd(dailySales$Date)
-
-
-#Add ISO week column, month column, and ISO year column.
-dailySales <- dailySales %>% mutate(isoWeek = isoweek(Date), 
-                                    regWeek = week(Date),
-                                    Month = month(Date), 
-                                    isoYear = isoyear(Date),
-                                    regYear = year(Date))
-
-
-#Get the range of the dates captured in the sales table.
-range(dailySales$Date)
-
-#Check if there are any rows where store is indicated as 
-#closed, but Sales amount or customer count exists.
-dailySales[which(dailySales$Open == 0 & (dailySales$Sales >0 | 
-                                     dailySales$Customers >0)),]
-
-#Check if there are any rows where store is indicated as open, but
-#Sales amount or Customers amount is 0.
-noSalesOpen <- dailySales[which(dailySales$Open == 1 & (dailySales$Sales == 0 |
-                                    dailySales$Customers==0 )),]
-
-noSalesOpenRows <- which(dailySales$Open == 1 & (dailySales$Sales <= 0 | dailySales$Customers <=0))
-
-
-length(noSalesOpenRows)
-
-#Remove all rows flagged Open but no sales or customers from above.
-dailySales <- dailySales[-noSalesOpenRows,]
-
-
-#Add Promo2 info to dailySales table.
-dailySales <-left_join(dailySales,select(promo2Info,Store,Promo2MonthNum,Promo2SinceDate),
-               by=c("Store"="Store","Month"="Promo2MonthNum"))
-
-promo2Fun <- function(tranDate, promo2Date) {
-ifelse((tranDate>=promo2Date),1,0)}
-
-#Create Promo2 indicator column in dailySales table.
-dailySales <- dailySales %>% mutate(Promo2 = promo2Fun(Date,Promo2SinceDate))
-
-
-#Add a 0 to any rows with NA under Promo2 in dailySales table.
-dailySales$Promo2[which(is.na(dailySales$Promo2))] <- 0
-
-
-#Check how many rows in storeMeta indicate competition distance but have no CompetitionSinceDate
-nrow(storeMeta[is.na(storeMeta$CompetitionSinceDate) & storeMeta$CompetitionDistance >0,])
-
-#Add the date "2013-01-01" under CompetitionSinceDate feature to all the rows identified above.
-storeMeta$CompetitionSinceDate[which(is.na(storeMeta$CompetitionSinceDate) & 
-                                       storeMeta$CompetitionDistance >0)] <- as.Date("2013-01-01")
-
-sapply(storeMeta, function(x) sum(is.na(x)))
-
-
-
-#Join the non-Promo2 info from storeMeta table to dailySales table.
-dailySales <- left_join(dailySales, select(storeMeta,1:4,9), by = c("Store" = "Store"))
-
-#Create a column to indicate if Competition exists for the store on the particular date of the transaction.
-compIndicator <- function(tranDate,compDate) {
-ifelse((tranDate>=compDate),1,0)  
-}
-
-dailySales <- dailySales %>% mutate(Competition = compIndicator(Date,CompetitionSinceDate))
-
-
-
-#Create a Min Max scaling function.
-normalize <- function(x) {
-  return ((x - min(x)) / (max(x) - min(x))) }
-
-#Create table with average daily for each store.
-AvgDailySales <- dailySales %>% filter(Open != 0) %>%
-            filter(Date < "2015-07-01") %>%
-            group_by(Store) %>%
-            summarise(Avg = sum(Sales)/n())
-
-#Add stores daily average sales to dailySales table.
-dailySales <- left_join(dailySales,AvgDailySales)
-
-
-
-#For rows missing CompetitionDistance and Competition indicator due to no info in storeMeta table,
-# replace the NA values with "0" for Competition and max value of CompetitionDistance feature.
-dailySales$CompetitionDistance[which(is.na(dailySales$CompetitionDistance))] <- max(dailySales$CompetitionDistance, na.rm = TRUE)
-dailySales$Competition[which(is.na(dailySales$Competition))] <-0
-
-sapply(dailySales,function(x) sum(is.na(x)))
-##############Random Forest Code#####################################
-#Create a table for Random Forest Model from the dailySales table.
-  #Remove all rows flagged as closed from dailySales table.
-
-
-  dailyRFData <- dailySales %>% filter(Open !=0)
-
-  #Remove the columns: Date, Customers, regWeek, regYear, Promo2SinceDate, CompetitionSinceDate.
-  dailyRFData <- dailyRFData %>% select(-c("Customers","regWeek", "regYear",
-                                           "Promo2SinceDate", "CompetitionSinceDate"))
-
-  
-  RFTest <- dailyRFData %>% filter(Date >= as.Date("2015-07-01")) %>% 
-            select(-"Date")
-
-  RFTrain <- dailyRFData %>% filter(Date < as.Date("2015-07-01")) %>%
-            select(-"Date")
-  
-  
-  startTime <- Sys.time()
-  RFModel <- randomForest(y = RFTrain[,3], x = RFTrain[,c(-1,-3)], mtry = 16, 
-              ntree = 40, max_depth = 30, sampsize = 50000, importance = TRUE)
-  
-  #na.action = na.roughfix
-  #sampsize = 10000,
-  
-  endTime <- Sys.time()
-  varImpPlot(RFModel, type = 2)
-  
-  p1 <- predict(RFModel,RFTest[,-3])
-  paste("Started at:", startTime, "Ended at:", endTime, sep = " ")
-  RMSPE(p1,RFTest$Sales)
-  plot(RFModel)
-  
-###############################  
-  
-  
-
-  
-  
-#Create a chart by store calculating the proportion of days the store was 
-#open in a year.Stores with below normal proportion of days open will be eliminated
-#from data analysis so that only comparable stores are used across the entire
-#time period.
-
-#Calculate the number of calendar days in each ISO year.
-Days_2013 <- dailySales %>% filter(isoYear == 2013) %>%
-  summarise(n_distinct(Date))
-
-
-Days_2014 <- dailySales %>% filter(isoYear == 2014) %>%
-  summarise(n_distinct(Date))
-
-Days_2015 <- dailySales %>% filter(isoYear == 2015) %>%
-  summarise(n_distinct(Date))
-
-#Initially a table is created summarising by year and store, how many days they
-# were open based on days where Sales are greater than 0.
-PortionOfYearOpen <- dailySales %>% group_by(isoYear, Store) %>%
-  summarise(OpenDays = sum(Sales>0)) %>%
-  spread(isoYear,OpenDays) 
-
-#The number of days calculated in previous step is converted to a portion of days 
-#open in the specific ISO Year.
-PortionOfYearOpen$`2013`= PortionOfYearOpen$`2013`/Days_2013$`n_distinct(Date)`
-PortionOfYearOpen$`2014` = PortionOfYearOpen$`2014`/Days_2014$`n_distinct(Date)`
-PortionOfYearOpen$`2015` = PortionOfYearOpen$`2015`/Days_2015$`n_distinct(Date)`
-
-
-#Stores are filtered if they were open less than 0.75 of the possible days in any
-#one of the operating years.
-StoresMissingSales <- PortionOfYearOpen %>% 
-  filter(PortionOfYearOpen$`2013` < 0.75 |
-         PortionOfYearOpen$`2014` < 0.75 | 
-         PortionOfYearOpen$`2015` < 0.75)
-
-#Resulting table from above step.
-head(StoresMissingSales)
+#########################################EDA###############################################
 
 #Count of stores that will be removed from data analysis due to having uncomprable
 #years.
-
-ungroup(StoresMissingSales)
 length(StoresMissingSales$Store)
-
-
-#Remove stores with incomplete sales from dailySales and store the revised 
-#data frame in dailySales2.
-dailySales2 <- dailySales[which(!dailySales$Store %in% StoresMissingSales$Store),]
-
-#Filter stores with incomplete sales from dailySales and store in dailySales3.
-dailySales3 <- dailySales[which(dailySales$Store %in% StoresMissingSales$Store),]
-
-
-
-
-
-
-#########################################EDA###############################################
 
 #Plot the time series of the stores with missing data to demonstrate issue.
 tsSalesMissing <- dailySales3 %>% group_by(Date) %>%
@@ -294,6 +28,8 @@ salesByDate <- dailySales2 %>% group_by(Date) %>%
 #Plot a time series of the daily sales.
 dailySalesTS <- salesByDate$DailySales %>% 
   ts(frequency = 365.25, start = 2013)
+
+
 plot(dailySalesTS)
 
 
@@ -413,3 +149,154 @@ grid.table(combinedEDATable %>% filter(Date < as.Date("2015-01-01")) %>%
 
 grid.table(combinedEDATable %>% group_by(Competition) %>%
                       summarise( AvgDailySales =sum(Sales)/n()))
+
+
+#Count the number of operating days in 2013 and 2014 based on ISO year.
+combinedEDATable %>% group_by(isoYear) %>%
+                      summarise(Num_Of_Days = n_distinct(Date))
+
+#Create a table with matching days between 2013 and 2014 based on ISO year, ISO week, and day of week.
+#Then use that table to filter out matching rows from the combinedEDATable.
+
+dates2013 <- combinedEDATable %>% filter(isoYear == 2013) %>%
+              group_by(isoWeek, DayOfWeek) %>%
+              summarise()
+
+dates2014 <- combinedEDATable %>% filter(isoYear == 2014) %>%
+              group_by(isoWeek, DayOfWeek) %>%
+              summarise()
+
+dates20132014 <- dplyr::intersect(dates2013, dates2014) %>% ungroup()
+
+comparable20132014 <- combinedEDATable %>% filter(isoYear == 2013 | isoYear == 2014) %>%
+                    dplyr::semi_join(dates20132014, by = c("isoWeek", "DayOfWeek"))
+
+#Create a table to show distribution of sales in 2013 and 2014.
+
+sales20132014 <- comparable20132014 %>% group_by(isoYear, Store) %>%
+                      summarise(Sales = sum(Sales)) %>%
+                      ungroup() %>%
+                      spread(isoYear,Sales)
+
+summary(sales20132014)
+
+#Calculate the IQR for 2013 and 2014 to see the precense of outliers.
+
+IQR2013 <- IQR(sales20132014$`2013`)
+Q12013 <- quantile(sales20132014$`2013`, 0.25)
+Q32013<- quantile(sales20132014$`2013`, 0.75)
+
+IQR2014 <- IQR(sales20132014$`2014`)
+Q12014 <- quantile(sales20132014$`2014`, 0.25)
+Q32014<- quantile(sales20132014$`2014`, 0.75)
+
+#Check for outliers that are on the bottom end for 2013.
+sum(sales20132014$`2013` < Q12013-(1.5*IQR2013))
+
+#Check for outlers that are on the top end for 2013.
+sum(sales20132014$`2013` > Q32013+(1.5*IQR2013))
+
+
+#Check for outliers that are on the bottom end for 2014.
+sum(sales20132014$`2014` < Q12014-(1.5*IQR2014))
+
+#Check for outlers that are on the top end for 2014.
+sum(sales20132014$`2014` > Q32014+(1.5*IQR2014))
+
+#Create vectors for 2013 and 2014 that do not have the outliers on the top end.
+sales2013NoOutlier <- subset(sales20132014$`2013`, 
+                             !sales20132014$`2013` > Q32013+(1.5*IQR2013))
+
+
+sales2014NoOutlier <- subset(sales20132014$`2014`, 
+                      !sales20132014$`2014` > Q32014+(1.5*IQR2014))
+
+t.test(sales2013NoOutlier,sales2014NoOutlier)
+
+
+set.seed(1)
+{salesMean2013 <- vector()
+salesMean2014 <- vector()
+for (i in 1:5000) {
+salesMean2013[i] <- mean(sample(sales2013NoOutlier, 250, replace = FALSE))
+salesMean2014[i] <- mean(sample(sales2014NoOutlier, 250, replace = FALSE))
+}}
+
+shapiro.test(salesMean2013)
+shapiro.test(salesMean2014)
+
+
+sd(salesMean2013)
+sd(salesMean2014)
+mean(salesMean2013)
+mean(salesMean2014)
+
+
+salesMean2013<- scale(salesMean2013, center = TRUE, scale = TRUE)
+salesMean2014<- scale(salesMean2014, center = TRUE, scale = TRUE)
+
+hist(salesMean2013, probability = TRUE)
+hist(salesMean2014, probability = TRUE)
+
+
+sdp <- function(x) sqrt(mean((x-mean(x))^2))
+
+z.test(salesMean2013, 
+       salesMean2014, 
+       sigma.x = sdp(salesMean2013), 
+       sigma.y = sdp(salesMean2014))
+
+t.test(salesMean2013, 
+       salesMean2014, var.equal = FALSE)
+
+t.test(sales20132014$`2013`, sales20132014$`2014`, paired = TRUE)
+
+z.test(salesMean2013[-c(which(salesMean2013 > 3 | salesMean2013 < -3))], 
+       salesMean2014[-c(which(salesMean2014 > 3 | salesMean2014 < -3))], 
+       sigma.x = sdp(salesMean2013[-c(which(salesMean2013 > 3 | salesMean2013 < -3))]), 
+       sigma.y = sdp(salesMean2014[-c(which(salesMean2014 > 3 | salesMean2014 < -3))]),
+       conf.level = 0.99)
+
+hist(salesMean2013[-c(which(salesMean2013 > 3 | salesMean2013 < -3))], probability = TRUE)
+salesMean2014[-c(which(salesMean2014 > 3 | salesMean2014 < -3))]
+sum(salesMean2014 > 3 | salesMean2014 < -3)
+
+
+
+#######EDA of Metastore Data#######
+#Percentage breakdown of stores based on StoreType and Assortment.
+storeBreakdown <- as.data.frame(storeMeta %>% group_by(StoreType, Assortment) %>%
+                                  summarise(n = n()) %>%
+                                  ungroup() %>%
+                                  mutate(Relative_Frequency = n/sum(n)) %>%
+                                  select(-3) %>%            
+                                  spread(Assortment, Relative_Frequency))
+
+storeBreakdown
+
+rownames(storeBreakdown) <- storeBreakdown$StoreType
+storeBreakdown <- storeBreakdown[-1]
+storeBreakdown["Total"] <- rowSums(storeBreakdown, na.rm = TRUE)
+storeBreakdown
+
+#Percentage breakdown of stores that participate in Promo2.
+storeMeta %>% group_by(Promo2) %>%
+  summarise(Num_of_Stores = n()) %>%
+  mutate(Relative_Frequency = Num_of_Stores/sum(Num_of_Stores))
+
+
+#Percentage brekdown of stores based on store type that participate in Promo2.
+storeMeta %>% group_by(StoreType,Promo2) %>%
+  summarise(n = n()) %>%
+  mutate(Relative_Frequency = n/sum(n)) %>%
+  select(-3) %>%
+  spread(StoreType,value = c(Relative_Frequency))
+
+#Percentage breakdown of stores based on store type, and Assortment that participate in 
+#Promo2.
+
+storeMeta %>% group_by(StoreType, Assortment, Promo2) %>%
+  summarise(n = n()) %>%
+  mutate(Relative_Frquency = n/sum(n)) %>%
+  select(-4) %>%
+  spread(StoreType, Relative_Frquency)
